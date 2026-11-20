@@ -4,12 +4,14 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 
-from audit.readback import read
-from freeze.issue import freeze
+from audit.readback import read, read_settlement
+from freeze.issue import freeze, freeze_correction
 from intake.revisions import record
 from intake.rows import ObservationRow, RevisionInput, SourceSegment
 from lake_db import open_receiver, open_source
+from publish.corrections import publish_correction
 from publish.service import publish
+from settlement_examples import CASES, submission as settlement_submission
 from transfer.completions import event
 from transfer.dispatch import cancel, copy
 from transfer.operations import list_operations
@@ -89,6 +91,65 @@ def run_demo(root):
             print(f'{origin.segment_id} {liters} L [{origin.segment_source}] {", ".join(origin.row_sources)}')
         print(f'Receipt {receipt.receipt_id}, revision {result.receipt.manifest.revision}, total {result.totals.total} L')
         print('POINTWISE_SCENARIO ' + json.dumps(evidence, ensure_ascii=False, sort_keys=True))
+    return run_settlement_demo(root / 'settlement')
+
+
+def run_settlement_demo(root):
+    """Drive the ``partial`` correction chain, then settle after source and execution detach."""
+    layouts, allocations = CASES['partial']
+    root.mkdir()
+    receiver_path = root / 'receiver.sqlite3'
+    with CopyPort(root / 'remote.sqlite3') as port:
+        with closing(open_receiver(receiver_path)) as receiver:
+            with closing(open_source(root / 'source.sqlite3')) as source:
+                first = record(source, settlement_submission(layouts[0]))
+                manifests = [freeze(source, first.day, first.revision)]
+                for number, values in enumerate(layouts[1:], 1):
+                    version = record(source, settlement_submission(values))
+                    manifests.append(freeze_correction(
+                        source, manifests[-1].manifest_id, version.revision, allocations[number - 1],
+                    ))
+                requests = [f'settlement-{number}' for number in range(1, len(manifests) + 1)]
+                for request, manifest in zip(requests, manifests, strict=True):
+                    copy(source, receiver, port, request, manifest.manifest_id)
+                for request in requests:
+                    operations = list_operations(receiver, request)
+                    for operation in operations:
+                        port.execute(operation.operation_id)
+                    for operation in reversed(operations):
+                        port.deliver(operation.operation_id, lambda notice: event(receiver, port, notice))
+            receipts = [publish(receiver, port, requests[0]).receipt_id]
+            for request in requests[1:]:
+                receipts.append(publish_correction(receiver, port, request, receipts[-1]).receipt_id)
+        # Source and execution stores are now closed; only the receiver reopens.
+    with closing(open_receiver(receiver_path)) as receiver:
+        settlement = read_settlement(receiver, receipts[0], 0, 0, receipts[-1])
+        last = read(receiver, receipts[-1])
+        expected = {'carried': (6, 10), 'outstanding': (0, 4), 'settled': False}
+        observed = {key: settlement[key] for key in expected}
+        if observed != expected:
+            print('SETTLEMENT_MISMATCH ' + json.dumps(settlement), file=sys.stderr)
+            return 1
+        evidence = {
+            'case_id': 'settlement-partial',
+            'base_receipt_id': settlement['base_receipt_id'],
+            'target_receipt_id': settlement['target_receipt_id'],
+            'segment_position': settlement['segment_position'],
+            'row_position': settlement['row_position'],
+            'row_provenance': settlement['row_provenance'],
+            'carried': list(settlement['carried']),
+            'outstanding': list(settlement['outstanding']),
+            'settled': settlement['settled'],
+            'last_segments': [
+                [detail.provenance.segment_id, [row.liters for row in detail.rows]]
+                for detail in last.segments
+            ],
+            'downstream_expected': {'carried': [6, 10], 'outstanding': [0, 4], 'settled': False},
+            'code_paths': ['freeze/allocations.py', 'freeze/issue.py', 'publish/corrections.py',
+                           'publish/catalog.py', 'audit/settlement.py', 'audit/readback.py'],
+            'oracle': 'Min/max carried liters over the frozen allocation chain after reopening only the receiver.',
+        }
+        print('SETTLEMENT_SCENARIO ' + json.dumps(evidence, ensure_ascii=False, sort_keys=True))
     return 0
 
 

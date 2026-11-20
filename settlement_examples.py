@@ -1,18 +1,21 @@
+"""Two four-version worked examples for correction settlement."""
+
 import json
 from contextlib import closing
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
-from audit.readback import read
-from freeze.issue import freeze
+from audit.readback import read, read_settlement
+from freeze.issue import freeze, freeze_correction
 from intake.revisions import record
 from intake.rows import ObservationRow, RevisionInput, SourceSegment
 from lake_db import open_receiver, open_source
+from publish.corrections import publish_correction
 from publish.service import publish
 from transfer.completions import event
 from transfer.dispatch import copy
 from transfer.operations import list_operations
 from transfer.port import CopyPort
+from tempfile import TemporaryDirectory
 
 DAY = "2026-04-20"
 ROW_SOURCE = "station-sheet/shared-line"
@@ -30,6 +33,10 @@ CASES = {
         FIRST_VERSIONS + (((4,), (8, 8)),),
         FIRST_ALLOCATIONS + (((0, 0, 0, 0, 4), (1, 0, 1, 0, 8), (1, 0, 1, 1, 8)),),
     ),
+}
+EXPECTED = {
+    "partial": {"carried": (6, 10), "outstanding": (0, 4), "settled": False},
+    "complete": {"carried": (10, 10), "outstanding": (0, 0), "settled": True},
 }
 
 
@@ -75,11 +82,51 @@ def run_v1(root, case_id):
     return {"case": case_id, "ordinary_ledger": ledger}
 
 
+def run_correction(root, case_id):
+    layouts, allocations = CASES[case_id]
+    receiver_path = root / "receiver.sqlite3"
+    with closing(open_receiver(receiver_path)) as receiver, CopyPort(root / "remote.sqlite3") as port:
+        with closing(open_source(root / "source.sqlite3")) as source:
+            first = record(source, submission(layouts[0]))
+            manifests = [freeze(source, first.day, first.revision)]
+            for number, layout in enumerate(layouts[1:], 1):
+                version = record(source, submission(layout))
+                manifests.append(freeze_correction(
+                    source, manifests[-1].manifest_id, version.revision, allocations[number - 1],
+                ))
+            requests = [f"ordinary-{number}" for number in range(1, len(manifests) + 1)]
+            for request, manifest in zip(requests, manifests, strict=True):
+                copy(source, receiver, port, request, manifest.manifest_id)
+            for request in requests:
+                operations = list_operations(receiver, request)
+                for operation in operations:
+                    port.execute(operation.operation_id)
+                for operation in reversed(operations):
+                    port.deliver(operation.operation_id, lambda notice: event(receiver, port, notice))
+        receipts = [publish(receiver, port, requests[0]).receipt_id]
+        parent_receipts = list(receipts)
+        for request in requests[1:]:
+            receipts.append(publish_correction(receiver, port, request, parent_receipts[-1]).receipt_id)
+            parent_receipts.append(receipts[-1])
+    with closing(open_receiver(receiver_path)) as receiver:
+        settlement = read_settlement(receiver, receipts[0], 0, 0, receipts[-1])
+        expected = EXPECTED[case_id]
+        if {key: settlement[key] for key in expected} != expected:
+            raise AssertionError(f"{case_id}: settlement {settlement} does not match {expected}")
+        first_view = read(receiver, receipts[0])
+        if [row.liters for row in first_view.segments[0].rows] != [10, 10]:
+            raise AssertionError(f"{case_id}: ordinary receipt no longer shows the two 10 L rows")
+        if first_view.segments[1].rows:
+            raise AssertionError(f"{case_id}: ordinary receipt should show an empty east segment")
+    return {"case": case_id, "settlement": settlement}
+
+
 def main():
     for case_id in CASES:
         with TemporaryDirectory() as directory:
             print(json.dumps(run_v1(Path(directory), case_id), sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

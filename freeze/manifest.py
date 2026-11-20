@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import json
 
+from freeze.allocations import Allocation, coerce_allocations, encode_allocations
 from freeze.digests import content_digest
 from freeze.payloads import canonical_bytes, encode_content
 from lake_db import InvalidInput, MaterialMismatch, require_id, require_label
@@ -21,6 +22,8 @@ class Manifest:
     day: str
     revision: int
     entries: tuple[ManifestEntry, ...]
+    parent_manifest_id: int | None = None
+    allocations: tuple[Allocation, ...] = ()
 
 
 def build_manifest(revision, manifest_id):
@@ -34,8 +37,15 @@ def build_manifest(revision, manifest_id):
     return Manifest(manifest_id, revision.day, revision.revision, entries)
 
 
+def build_correction_manifest(revision, manifest_id, parent_manifest_id, allocations):
+    return Manifest(
+        manifest_id, revision.day, revision.revision,
+        build_manifest(revision, manifest_id).entries, parent_manifest_id, allocations,
+    )
+
+
 def encode_manifest(manifest):
-    return canonical_bytes({
+    obj = {
         'manifest_id': manifest.manifest_id,
         'day': manifest.day,
         'revision': manifest.revision,
@@ -43,7 +53,11 @@ def encode_manifest(manifest):
             [entry.position, entry.segment_id, entry.provenance, list(entry.row_provenance), entry.digest]
             for entry in manifest.entries
         ],
-    })
+    }
+    if manifest.parent_manifest_id is not None:
+        obj['parent_manifest_id'] = manifest.parent_manifest_id
+        obj['allocations'] = encode_allocations(manifest.allocations)
+    return canonical_bytes(obj)
 
 
 def _decode_entry(position, row):
@@ -73,7 +87,16 @@ def decode_manifest(payload):
         entries = tuple(_decode_entry(position, row) for position, row in enumerate(obj['entries']))
         if len({entry.segment_id for entry in entries}) != len(entries):
             raise ValueError('duplicate manifest segment')
-        manifest = Manifest(manifest_id, day, revision, entries)
+        has_parent = 'parent_manifest_id' in obj
+        has_allocations = 'allocations' in obj
+        if has_parent != has_allocations:
+            raise ValueError('correction manifest needs a parent and allocations')
+        parent_manifest_id, allocations = None, ()
+        if has_parent:
+            parent_manifest_id = obj['parent_manifest_id']
+            require_id(parent_manifest_id, 'parent manifest ID')
+            allocations = coerce_allocations(obj['allocations'], ValueError)
+        manifest = Manifest(manifest_id, day, revision, entries, parent_manifest_id, allocations)
         if encode_manifest(manifest) != payload:
             raise ValueError('manifest encoding is not canonical')
     except (ValueError, TypeError, KeyError, RecursionError, InvalidInput) as exc:
